@@ -1,33 +1,3 @@
-"""
-sealo.py — CLI Frontend for Sealo AI Assistant (v3.0)
-=====================================================
-This is the command-line interface (terminal UI) for the Sealo personal AI assistant.
-It handles user input (text + optional voice), sends prompts to the Groq-hosted LLM,
-displays formatted responses using the Rich library, and manages conversation memory.
-
-Architecture Overview:
-  sealo.py (this file) ─── the "face" of Sealo (UI, input/output, display)
-  sealo_core.py ────────── the "brain" of Sealo (LLM client, tools, agent loop)
-
-The entire AI logic (model calls, tool schemas, tool execution) lives in sealo_core.py.
-This file only handles the terminal UI layer.
-
-Key Dependencies:
-  - rich:    Beautiful terminal formatting (panels, markdown, spinners)
-  - dotenv:  Loads API keys from .env file
-  - pyttsx3: Optional text-to-speech for voice mode
-  - speech_recognition: Optional mic input for voice mode
-
-Pi Compatibility Notes:
-  - The 'rich' library works on any terminal with ANSI color support
-  - pyttsx3 voice may need 'espeak' installed on Linux/Pi: sudo apt install espeak
-  - speech_recognition requires pyaudio: sudo apt install portaudio19-dev
-"""
-
-# ═══════════════════════════════════════════════════════════════════════
-#  IMPORTS
-# ═══════════════════════════════════════════════════════════════════════
-
 import os
 import sys
 import json
@@ -38,85 +8,431 @@ import urllib.parse
 import threading
 import webbrowser
 from pathlib import Path
-from dotenv import load_dotenv       # Reads .env file for API keys
-from rich.console import Console     # Rich terminal output engine
-from rich.markdown import Markdown   # Renders markdown in terminal
-from rich.panel import Panel         # Draws bordered panels
-from rich.rule import Rule           # Draws horizontal separator lines
+from dotenv import load_dotenv
+from mistralai import Mistral
+from rich.console import Console
+from rich.markdown import Markdown
+from rich.panel import Panel
+import sealo_core as core
+import logging
+
+logger = logging.getLogger("SealoCLI")
 
 # --- Optional voice imports ---
-# These are wrapped in try/except so Sealo still works without them.
-# On a Pi, you'd need: pip install pyttsx3 SpeechRecognition pyaudio
 try:
-    import pyttsx3                   # Text-to-speech engine
-    import speech_recognition as sr  # Microphone speech-to-text
+    import pyttsx3
+    import speech_recognition as sr
     VOICE_AVAILABLE = True
 except ImportError:
-    VOICE_AVAILABLE = False          # Gracefully disable voice features
+    VOICE_AVAILABLE = False
 
-# Force UTF-8 output to prevent encoding crashes on Windows terminals
+# Force UTF-8 output
 if sys.stdout.encoding != 'utf-8':
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
-# Load environment variables from .env file (contains GROQ_API_KEY)
+# Load environment variables
 load_dotenv()
-
-# ═══════════════════════════════════════════════════════════════════════
-#  IMPORT CORE ENGINE
-# ═══════════════════════════════════════════════════════════════════════
-# All AI logic, tool definitions, and the agent loop live in sealo_core.py.
-# We import only the public API we need for the CLI.
-from sealo_core import (
-    client, MODEL_ID, TOOLS, TOOL_MAP,               # LLM client + tool registry
-    load_memory, save_memory, load_profile, save_profile,  # Persistence
-    format_profile_for_prompt, build_system_prompt, run_agent_loop,  # Agent engine
-    listen_from_mic, speak,                            # Voice functions
-    MEMORY_FILE, PROFILE_FILE                          # File paths for !mem and !profile
-)
-
-# Initialize the Rich console (handles all terminal output formatting)
+MODEL_ID = "mistral-large-latest"
 console = Console()
 
-# ═══════════════════════════════════════════════════════════════════════
-#  TOOL CALL CALLBACK
-# ═══════════════════════════════════════════════════════════════════════
+# --- File Paths ---
+SEALO_DIR = Path(__file__).parent
+MEMORY_FILE = SEALO_DIR / "memory.json"
+PROFILE_FILE = SEALO_DIR / "user_profile.json"
 
-def _on_tool_call(fn_name, fn_args, result):
-    """
-    Callback triggered by sealo_core.run_agent_loop() whenever a tool executes.
-    This prints a subtle cyan line in the terminal so the user can see which
-    tools Sealo is using in real-time while it "thinks".
-    
-    Example output:  > Using tool: web_search(query='weather in Tokyo')
-    """
-    console.print(f"  [dim cyan]> Using tool: {fn_name}({', '.join(f'{k}={repr(v)[:40]}' for k,v in fn_args.items())})[/dim cyan]")
+# ═══════════════════════════════════════════════════════════════════
+#  VOICE ENGINE
+# ═══════════════════════════════════════════════════════════════════
 
-# ═══════════════════════════════════════════════════════════════════════
-#  MAIN APPLICATION LOOP
-# ═══════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
+#  VOICE ENGINE
+# ═══════════════════════════════════════════════════════════════════
+
+_tts_engine = None
+_tts_lock = threading.Lock()
+
+def get_tts_engine():
+    global _tts_engine
+    if _tts_engine is None and VOICE_AVAILABLE:
+        _tts_engine = pyttsx3.init()
+        _tts_engine.setProperty('rate', 175)
+        _tts_engine.setProperty('volume', 1.0)
+        voices = _tts_engine.getProperty('voices')
+        for v in voices:
+            if 'david' in v.name.lower() or 'zira' in v.name.lower():
+                _tts_engine.setProperty('voice', v.id)
+                break
+    return _tts_engine
+
+def speak(text: str):
+    def _speak():
+        with _tts_lock:
+            engine = get_tts_engine()
+            if engine:
+                clean = text.replace('**', '').replace('*', '').replace('`', '').replace('#', '')
+                engine.say(clean)
+                engine.runAndWait()
+    threading.Thread(target=_speak, daemon=True).start()
+
+def listen_from_mic() -> str:
+    if not VOICE_AVAILABLE:
+        return ""
+    recognizer = sr.Recognizer()
+    with sr.Microphone() as source:
+        console.print("[bold yellow]Listening...[/bold yellow] (speak now)")
+        recognizer.adjust_for_ambient_noise(source, duration=0.5)
+        try:
+            audio = recognizer.listen(source, timeout=5, phrase_time_limit=15)
+            console.print("[dim]Processing speech...[/dim]")
+            return recognizer.recognize_google(audio)
+        except sr.WaitTimeoutError:
+            return ""
+        except sr.UnknownValueError:
+            console.print("[dim yellow]Could not understand audio.[/dim yellow]")
+            return ""
+        except Exception as e:
+            console.print(f"[dim red]Speech error: {e}[/dim red]")
+            return ""
+
+# ═══════════════════════════════════════════════════════════════════
+#  TOOLS
+# ═══════════════════════════════════════════════════════════════════
+
+def get_current_time() -> str:
+    now = datetime.datetime.now()
+    return now.strftime("Current date and time: %A, %B %d, %Y at %I:%M:%S %p")
+
+def list_directory(path: str) -> str:
+    try:
+        if not os.path.isdir(path):
+            return f"Error: '{path}' is not a valid directory."
+        items = os.listdir(path)
+        if not items:
+            return f"The directory '{path}' is empty."
+        formatted = "\n".join(
+            f"  {'[DIR] ' if os.path.isdir(os.path.join(path, i)) else '[FILE]'} {i}"
+            for i in sorted(items)
+        )
+        return f"Contents of '{path}':\n{formatted}"
+    except Exception as e:
+        return f"Error: {e}"
+
+def read_file(path: str) -> str:
+    try:
+        if not os.path.isfile(path):
+            return f"Error: '{path}' is not a valid file."
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            content = f.read()
+        if len(content) > 6000:
+            content = content[:6000] + "\n\n[... truncated at 6000 characters ...]"
+        return f"Content of '{path}':\n```\n{content}\n```"
+    except Exception as e:
+        return f"Error: {e}"
+
+def write_file(path: str, content: str) -> str:
+    try:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding='utf-8')
+        return f"Successfully wrote {len(content)} characters to '{path}'."
+    except Exception as e:
+        return f"Error writing file: {e}"
+
+def execute_python(code: str, save_as: str = "") -> str:
+    """Write Python code to a temp file, execute it, and return the output."""
+    try:
+        script_path = SEALO_DIR / "_temp_script.py"
+        script_path.write_text(code, encoding='utf-8')
+        result = subprocess.run(
+            [sys.executable, str(script_path)],
+            capture_output=True, text=True, timeout=30, encoding='utf-8', errors='replace'
+        )
+        stdout = result.stdout.strip()
+        stderr = result.stderr.strip()
+        output_parts = []
+        if stdout:
+            output_parts.append(f"Output:\n{stdout}")
+        if stderr:
+            output_parts.append(f"Errors/Warnings:\n{stderr}")
+        if not output_parts:
+            output_parts.append("Script ran successfully with no output.")
+        output = "\n\n".join(output_parts)
+        # If user wants to save the file under a real name
+        if save_as:
+            save_path = Path(save_as)
+            save_path.write_text(code, encoding='utf-8')
+            output += f"\n\nScript also saved to '{save_as}'."
+        return output
+    except subprocess.TimeoutExpired:
+        return "Error: Script timed out after 30 seconds."
+    except Exception as e:
+        return f"Error executing Python: {e}"
+
+def web_search(query: str) -> str:
+    try:
+        encoded = urllib.parse.quote(query)
+        url = f"https://api.duckduckgo.com/?q={encoded}&format=json&no_html=1&skip_disambig=1"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Sealo-AI/2.0'})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+        results = []
+        if data.get('Answer'):
+            results.append(f"**Quick Answer:** {data['Answer']}")
+        if data.get('AbstractText'):
+            results.append(f"**Summary:** {data['AbstractText']}")
+            if data.get('AbstractURL'):
+                results.append(f"**Source:** {data['AbstractURL']}")
+        for topic in data.get('RelatedTopics', [])[:5]:
+            if isinstance(topic, dict) and topic.get('Text'):
+                results.append(f"- {topic['Text']}")
+        if not results:
+            return f"No direct results found for '{query}'. The information might be too recent or obscure."
+        return f"Web search: '{query}'\n\n" + "\n".join(results)
+    except Exception as e:
+        return f"Error searching: {e}"
+
+def open_application(name_or_path: str) -> str:
+    """Open an application by name or full path."""
+    try:
+        # Common app shortcuts
+        app_map = {
+            'notepad': 'notepad.exe',
+            'calculator': 'calc.exe',
+            'explorer': 'explorer.exe',
+            'chrome': 'chrome',
+            'edge': 'msedge',
+            'word': 'WINWORD.EXE',
+            'excel': 'EXCEL.EXE',
+            'powerpoint': 'POWERPNT.EXE',
+            'vscode': 'code',
+            'terminal': 'wt.exe',
+            'cmd': 'cmd.exe',
+            'task manager': 'taskmgr.exe',
+            'paint': 'mspaint.exe',
+            'spotify': 'spotify',
+        }
+        target = app_map.get(name_or_path.lower().strip(), name_or_path)
+        os.startfile(target) if os.path.isabs(target) else subprocess.Popen(
+            target, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        return f"Launched '{name_or_path}' successfully."
+    except Exception as e:
+        return f"Error launching '{name_or_path}': {e}"
+
+def open_url(url: str) -> str:
+    """Open a URL in the default web browser."""
+    try:
+        if not url.startswith(('http://', 'https://')):
+            url = 'https://' + url
+        webbrowser.open(url)
+        return f"Opened '{url}' in your browser."
+    except Exception as e:
+        return f"Error opening URL: {e}"
+
+def update_user_profile(field: str, value: str) -> str:
+    """Update the user's persistent profile. Fields: name, occupation, projects, skills, preferences, notes."""
+    profile = core.load_profile()
+    list_fields = ['projects', 'skills', 'preferences', 'notes']
+    if field in list_fields:
+        if value not in profile[field]:
+            profile[field].append(value)
+            core.save_profile(profile)
+            return f"Added '{value}' to your {field}."
+        return f"'{value}' was already in your {field}."
+    elif field in profile:
+        profile[field] = value
+        core.save_profile(profile)
+        return f"Updated your {field} to '{value}'."
+    else:
+        return f"Unknown profile field '{field}'. Valid fields: name, occupation, projects, skills, preferences, notes."
+
+def run_command(command: str) -> str:
+    blocked = ['del ', 'rm ', 'rmdir /s', 'format ', 'shutdown', ': delete', 'rd /s']
+    for b in blocked:
+        if b.lower() in command.lower():
+            return f"Error: The command contains a blocked keyword '{b.strip()}' for safety reasons."
+    try:
+        result = subprocess.run(
+            command, shell=True, capture_output=True, text=True, timeout=15,
+            encoding='utf-8', errors='replace'
+        )
+        output = result.stdout.strip() or result.stderr.strip()
+        return output[:4000] if output else "(No output)"
+    except subprocess.TimeoutExpired:
+        return "Error: Command timed out."
+    except Exception as e:
+        return f"Error: {e}"
+
+# ═══════════════════════════════════════════════════════════════════
+#  TOOL SCHEMAS
+# ═══════════════════════════════════════════════════════════════════
+
+# ── Mistral Tool Mapping ─────────────────────────────────────────────
+
+MISTRAL_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_current_time",
+            "description": "Get the current local date and time.",
+            "parameters": {"type": "object", "properties": {}}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_directory",
+            "description": "List files and folders inside a directory.",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string", "description": "Path to the directory."}},
+                "required": ["path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read the text content of a file.",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string", "description": "Path to the file."}},
+                "required": ["path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Write or create a text file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path to write to."},
+                    "content": {"type": "string", "description": "Full text content."}
+                },
+                "required": ["path", "content"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "execute_python",
+            "description": "Write and EXECUTE Python code.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {"type": "string", "description": "The Python code to execute."},
+                    "save_as": {"type": "string"}
+                },
+                "required": ["code"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the internet.",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "open_application",
+            "description": "Open an application.",
+            "parameters": {
+                "type": "object",
+                "properties": {"name_or_path": {"type": "string"}},
+                "required": ["name_or_path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "open_url",
+            "description": "Open a URL.",
+            "parameters": {
+                "type": "object",
+                "properties": {"url": {"type": "string"}},
+                "required": ["url"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_user_profile",
+            "description": "Update user profile.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "field": {"type": "string"},
+                    "value": {"type": "string"}
+                },
+                "required": ["field", "value"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_command",
+            "description": "Run shell command.",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"]
+            }
+        }
+    }
+]
+
+TOOL_MAP = {
+    "get_current_time": get_current_time,
+    "list_directory": list_directory,
+    "read_file": read_file,
+    "write_file": write_file,
+    "execute_python": execute_python,
+    "web_search": web_search,
+    "open_application": open_application,
+    "open_url": open_url,
+    "update_user_profile": update_user_profile,
+    "run_command": run_command,
+}
+
+# ═══════════════════════════════════════════════════════════════════
+#  MAIN LOOP
+# ═══════════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════
+#  MAIN LOOP
+# ═══════════════════════════════════════════════════════════════════
 
 def main():
-    """
-    Main entry point for the Sealo CLI application.
-    
-    Flow:
-    1. Load user profile and update last_seen timestamp
-    2. Display welcome banner
-    3. Load conversation memory (previous messages)
-    4. Enter input loop:
-       a. Get user input (keyboard or microphone)
-       b. Check for built-in commands (!voice, !mem clear, !profile, exit)
-       c. Send message to LLM via run_agent_loop()
-       d. Display formatted response
-       e. Save updated conversation history
-    """
-    # --- Load and update user profile ---
-    profile = load_profile()
+    profile = core.load_profile()
     profile["last_seen"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-    save_profile(profile)
+    core.save_profile(profile)
 
-    # --- Build and display the welcome banner ---
-    greeting = "Sealo AI - Your A.I Assistant"
+    # Initialize Agent
+    agent = core.SealoAgent(api_key=core.api_key, model_id=MODEL_ID)
+    agent.set_system_prompt(core.build_system_prompt(profile))
+    
+    # Load past memory
+    initial_history = core.load_memory()
+    agent.load_history(initial_history)
+
+    # Build greeting
+    greeting = "Sealo AI - A.I Assistant"
     if profile.get("name"):
         subtitle = f"Welcome back, {profile['name']}. Ready to work."
     else:
@@ -128,37 +444,34 @@ def main():
     if VOICE_AVAILABLE:
         console.print("[dim]Voice mode available. Type !voice to toggle.[/dim]")
 
-    # --- Load previous conversation history from memory.json ---
-    history = load_memory()
-    if history:
-        console.print(f"[dim]Resumed with {len(history)} messages in memory.[/dim]")
+    if initial_history:
+        console.print(f"[dim]Resumed with {len(initial_history)} messages in memory.[/dim]")
     console.print()
 
-    voice_mode = False  # Toggle for speech input/output mode
+    voice_mode = False
 
-    # --- Main conversation loop ---
     while True:
         try:
-            # --- Get user input (text or voice) ---
+            # Input
             if voice_mode and VOICE_AVAILABLE:
-                user_input = listen_from_mic()    # Listen via microphone
+                user_input = listen_from_mic()
                 if user_input:
                     console.print(f"[bold green]You (voice) >[/bold green] {user_input}")
                 else:
-                    continue  # No speech detected, loop again
+                    continue
             else:
-                user_input = console.input("[bold green]You > [/bold green]")  # Keyboard input
+                user_input = console.input("[bold green]You > [/bold green]")
 
-            # ── Built-in Commands ────────────────────────────────────
-            # These are handled locally without sending to the LLM.
+            if not user_input.strip():
+                continue
 
-            # EXIT: Quit the application
-            if user_input.lower() in ['exit', 'quit']:
+            # --- Built-in commands ---
+            cmd = user_input.lower().strip()
+            if cmd in ['exit', 'quit']:
                 console.print("\n[bold cyan]Sealo >[/bold cyan] Signing off. See you next time!")
                 break
 
-            # !VOICE: Toggle voice input/output mode
-            if user_input.strip().lower() == '!voice':
+            if cmd == '!voice':
                 if not VOICE_AVAILABLE:
                     console.print("[red]Voice unavailable.[/red] Install pyttsx3 and SpeechRecognition.")
                 else:
@@ -167,64 +480,48 @@ def main():
                     console.print(f"[bold cyan]Sealo >[/bold cyan] Voice mode {status}")
                 continue
 
-            # !MEM CLEAR: Wipe conversation history
-            if user_input.strip().lower() == '!mem clear':
+            if cmd == '!mem clear':
                 if MEMORY_FILE.exists():
-                    MEMORY_FILE.unlink()    # Delete memory.json
-                    history = []            # Clear in-memory history
+                    MEMORY_FILE.unlink()
+                    agent.history = []
                     console.print("[bold cyan]Sealo >[/bold cyan] Memory cleared.")
                 else:
                     console.print("[bold cyan]Sealo >[/bold cyan] Memory was already empty.")
                 continue
 
-            # !PROFILE: Display current user profile as JSON
-            if user_input.strip().lower() == '!profile':
-                profile = load_profile()
+            if cmd == '!profile':
+                p = core.load_profile()
                 console.print("\n[bold cyan]User Profile:[/bold cyan]")
-                console.print(Markdown(f"```json\n{json.dumps(profile, indent=2)}\n```"))
+                console.print(Markdown(f"```json\n{json.dumps(p, indent=2)}\n```"))
                 continue
 
-            # Skip empty input
-            if not user_input.strip():
-                continue
+            # Update system prompt with potential profile changes
+            agent.set_system_prompt(core.build_system_prompt(core.load_profile()))
 
-            # ── Send to LLM ──────────────────────────────────────────
-            # Append the user's message to conversation history
-            history.append({"role": "user", "content": user_input})
-            
-            # Build the system prompt (includes user profile + current time)
-            system_prompt = build_system_prompt(load_profile())
-
-            # Call the agent loop — this sends the message to Groq's API,
-            # handles any tool calls the LLM makes, and returns the final text.
-            # The spinner animation shows while we wait for the response.
             with console.status("[dim]Sealo is thinking...[/dim]", spinner="dots"):
-                final_text, history = run_agent_loop(history, system_prompt, on_tool_call=_on_tool_call)
+                # chat() will append user_input to agent.history
+                final_text = agent.chat(user_input)
 
-            # --- Display the response ---
             console.print(f"\n[bold cyan]Sealo >[/bold cyan]")
-            console.print(Markdown(final_text))   # Render as markdown for formatting
+            console.print(Markdown(final_text))
             console.print()
 
-            # If voice mode is on, speak the response aloud
             if voice_mode:
                 speak(final_text)
 
-            # Save updated conversation history to disk (persists between sessions)
-            save_memory(history)
+            # Save historical dicts
+            core.save_memory(agent.history)
 
         except KeyboardInterrupt:
-            # Handle Ctrl+C gracefully
-            console.print("\n[bold cyan]Sealo >[/bold cyan] Interrupted. Shutting down!")
-            break
+            if agent.is_thinking if hasattr(agent, "is_thinking") else False:
+                console.print("\n[bold yellow]Sealo >[/bold yellow] Stopping agent...")
+                agent.stop()
+            else:
+                console.print("\n[bold cyan]Sealo >[/bold cyan] Interrupted. Shutting down!")
+                break
         except Exception as e:
-            # Catch and display any errors without crashing
             console.print(f"\n[bold red]Error:[/bold red] {e}")
-            import traceback
-            traceback.print_exc()
+            logger.exception("Unexpected error in CLI main loop")
 
-# ═══════════════════════════════════════════════════════════════════════
-#  ENTRY POINT
-# ═══════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     main()

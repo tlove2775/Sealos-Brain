@@ -10,6 +10,9 @@ import customtkinter as ctk
 from tkinter import filedialog, messagebox, ttk
 import tkinter as tk
 import sealo_core as core
+import logging
+
+logger = logging.getLogger("SealoGUI")
 
 try:
     from sealo_live_voice import LiveVoiceSession, PYAUDIO_AVAILABLE
@@ -48,7 +51,7 @@ FONT_FAMILY = "Segoe UI"
 # ──────────────────────────── App ────────────────────────────────────
 
 class SealoChatBubble(ctk.CTkFrame):
-    """A single chat message bubble."""
+    """A single chat message bubble with basic markdown-ish rendering."""
     def __init__(self, parent, text: str, role: str, tool_info: str = "", **kwargs):
         color = COLORS["user_bubble"] if role == "user" else COLORS["ai_bubble"]
         super().__init__(parent, fg_color=color, corner_radius=12, **kwargs)
@@ -59,13 +62,27 @@ class SealoChatBubble(ctk.CTkFrame):
         ctk.CTkLabel(self, text=label, font=(FONT_FAMILY, 11, "bold"),
                      text_color=label_color, anchor="w").pack(anchor="w", padx=12, pady=(8, 2))
 
-        # Message text — use CTkLabel for max compatibility
-        display_text = text
-        ctk.CTkLabel(
-            self, text=display_text, font=(FONT_FAMILY, 13),
-            text_color=COLORS["text"], anchor="w", justify="left",
-            wraplength=680
-        ).pack(fill="x", padx=12, pady=(0, 6), expand=True)
+        # Message text — use CTkTextbox for selective styling
+        self.text_area = ctk.CTkTextbox(
+            self, font=(FONT_FAMILY, 13), text_color=COLORS["text"],
+            fg_color="transparent", border_width=0, wrap="word",
+            height=20, # Initial small height, will expand
+            activate_scrollbars=False
+        )
+        self.text_area.pack(fill="x", padx=6, pady=(0, 2))
+        
+        # Tags for "markdown"
+        self.text_area.tag_config("bold", foreground=COLORS["accent"])
+        self.text_area.tag_config("code", foreground=COLORS["accent2"])
+        self.text_area.tag_config("code_block", foreground=COLORS["dim"])
+
+        self._render_markdown(text)
+        
+        # Auto-size height (rough estimate)
+        num_lines = text.count('\n') + 2
+        extra_height = (len(text) // 80) * 15
+        self.text_area.configure(height=num_lines * 20 + extra_height)
+        self.text_area.configure(state="disabled")
 
         # Timestamp
         ts = datetime.datetime.now().strftime("%I:%M %p")
@@ -79,6 +96,21 @@ class SealoChatBubble(ctk.CTkFrame):
             ctk.CTkLabel(tool_frame, text=tool_info, font=("Consolas", 10),
                          text_color=COLORS["dim"], anchor="w", wraplength=600, justify="left"
                          ).pack(anchor="w", padx=8, pady=4)
+
+    def _render_markdown(self, text: str):
+        """Simple regex-based bold and code highlighting."""
+        # This is a very basic parser
+        parts = re.split(r'(\*\*.*?\*\*|`.*?`|```.*?```)', text, flags=re.DOTALL)
+        for part in parts:
+            if part.startswith('```') and part.endswith('```'):
+                content = part[3:-3].strip()
+                self.text_area.insert("end", content + "\n", "code_block")
+            elif part.startswith('`') and part.endswith('`'):
+                self.text_area.insert("end", part[1:-1], "code")
+            elif part.startswith('**') and part.endswith('**'):
+                self.text_area.insert("end", part[2:-2], "bold")
+            else:
+                self.text_area.insert("end", part)
 
 
 
@@ -95,6 +127,12 @@ class SealoGUI(ctk.CTk):
         self.profile = core.load_profile()
         self.profile["last_seen"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
         core.save_profile(self.profile)
+        
+        # Initialize Agent
+        self.agent = core.SealoAgent(api_key=core.api_key, model_id=core.MODEL_ID)
+        self.agent.set_system_prompt(core.build_system_prompt(self.profile))
+        self.agent.load_history(self.history)
+
         self.voice_mode = False
         self.is_thinking = False
         self._pending_tool_lines = []
@@ -114,7 +152,7 @@ class SealoGUI(ctk.CTk):
         topbar.pack_propagate(False)
         ctk.CTkLabel(topbar, text="  SEALO", font=(FONT_FAMILY, 18, "bold"),
                      text_color=COLORS["accent"]).pack(side="left", padx=16)
-        ctk.CTkLabel(topbar, text="Beast Mode  ·  v3.0", font=(FONT_FAMILY, 12),
+        ctk.CTkLabel(topbar, text="A.I Assistant  ·  v3.0", font=(FONT_FAMILY, 12),
                      text_color=COLORS["dim"]).pack(side="left")
 
         # Top-right controls
@@ -216,12 +254,25 @@ class SealoGUI(ctk.CTk):
         self.input_box.bind("<Return>", lambda e: self._send())
         self.input_box.bind("<Shift-Return>", lambda e: None)
 
-        self.send_btn = ctk.CTkButton(
-            bar, text="Send", width=80, height=44,
-            fg_color=COLORS["accent"], hover_color=COLORS["accent2"],
-            font=(FONT_FAMILY, 13, "bold"), corner_radius=10, command=self._send
+        self.attach_btn = ctk.CTkButton(
+            bar, text="+", width=40, height=44,
+            fg_color=COLORS["card"], hover_color=COLORS["accent"],
+            font=(FONT_FAMILY, 18, "bold"), corner_radius=10, command=self._attach_file
         )
+        self.attach_btn.pack(side="left", padx=(0, 6), pady=12)
+
+        self.send_btn = ctk.CTkButton(bar, text="Send", width=70, height=44,
+                                      fg_color=COLORS["accent"], hover_color=COLORS["accent2"],
+                                      font=(FONT_FAMILY, 13), corner_radius=10, command=self._send)
         self.send_btn.pack(side="left", padx=(0, 6), pady=12)
+
+        self.stop_btn = ctk.CTkButton(
+            bar, text="Stop", width=70, height=44,
+            fg_color=COLORS["card"], hover_color=COLORS["error"],
+            font=(FONT_FAMILY, 13), corner_radius=10, command=self._stop_thinking,
+            state="disabled"
+        )
+        self.stop_btn.pack(side="left", padx=(0, 6), pady=12)
 
         self.mic_btn = ctk.CTkButton(
             bar, text="Mic", width=60, height=44,
@@ -255,7 +306,19 @@ class SealoGUI(ctk.CTk):
                                  role=role, tool_info=tool_info)
         bubble.pack(fill="x", pady=6, padx=8)
         self.update_idletasks()
-        self.chat_scroll._parent_canvas.yview_moveto(1.0)
+        self._smooth_scroll()
+
+    def _smooth_scroll(self, steps=10, current_step=0):
+        """Animated scroll to bottom."""
+        target = 1.0
+        start = self.chat_scroll._parent_canvas.yview()[1]
+        if start >= 0.99 or current_step >= steps:
+            self.chat_scroll._parent_canvas.yview_moveto(1.0)
+            return
+        
+        next_val = start + (target - start) * 0.3
+        self.chat_scroll._parent_canvas.yview_moveto(next_val)
+        self.after(20, lambda: self._smooth_scroll(steps, current_step + 1))
 
     def _log_tool(self, name: str, args: dict, result: str):
         self.tool_log.configure(state="normal")
@@ -273,9 +336,13 @@ class SealoGUI(ctk.CTk):
         self.is_thinking = state
         if state:
             self.send_btn.configure(text="...", state="disabled", fg_color=COLORS["dim"])
+            self.stop_btn.configure(state="normal", fg_color=COLORS["card"])
+            self.attach_btn.configure(state="disabled")
             self.input_box.configure(state="disabled")
         else:
             self.send_btn.configure(text="Send", state="normal", fg_color=COLORS["accent"])
+            self.stop_btn.configure(state="disabled", fg_color=COLORS["card"])
+            self.attach_btn.configure(state="normal")
             self.input_box.configure(state="normal")
             self.input_box.focus()
 
@@ -285,8 +352,8 @@ class SealoGUI(ctk.CTk):
         msg = f"Hey {name}! I'm Sealo v3.0 — Beast Mode activated.\n"
         if mem_count:
             msg += f"I have {mem_count} messages in memory from our last session.\n"
-        if core.db_manager.conn:
-            msg += f"Database connected: {core.db_manager.path}"
+        if core._db_conn:
+            msg += f"Database connected: {core._db_path}"
         else:
             msg += "Connect a database using the sidebar to start querying your data."
         self._add_bubble(msg, "sealo")
@@ -315,6 +382,38 @@ class SealoGUI(ctk.CTk):
         self.input_box.delete(0, "end")
         self.input_box.insert(0, f"Describe the {table_name} table for me")
         self._send()
+
+    def _stop_thinking(self):
+        """Action for the Stop button."""
+        if self.is_thinking:
+            self.agent.stop()
+            self._log_tool("USER_INTERRUPT", {}, "Stopping agent loop...")
+
+    def _attach_file(self):
+        """Open a file dialog and suggest analysis to the agent."""
+        path = filedialog.askopenfilename(
+            title="Select File to Analyze",
+            filetypes=[
+                ("All Supported", "*.txt *.py *.md *.json *.sql *.png *.jpg *.jpeg *.webp"),
+                ("Text Files", "*.txt *.py *.md *.json *.sql"),
+                ("Images", "*.png *.jpg *.jpeg *.webp"),
+                ("All Files", "*.*")
+            ]
+        )
+        if path:
+            file_path = Path(path)
+            ext = file_path.suffix.lower()
+            
+            # Auto-prepare a message for the user to confirm or edit
+            if ext in [".png", ".jpg", ".jpeg", ".webp"]:
+                suggestion = f"Analyze this image: {path}"
+            else:
+                suggestion = f"Read and explain this file: {path}"
+            
+            self.input_box.delete(0, "end")
+            self.input_box.insert(0, suggestion)
+            # We don't auto-send to give the user a chance to add their own prompt
+            self._log_tool("FILE_ATTACH", {"path": path}, "File selected. Press Send to analyze.")
 
     # ── Actions ──────────────────────────────────────────────────────
 
@@ -448,35 +547,27 @@ class SealoGUI(ctk.CTk):
         system_prompt = core.build_system_prompt(profile)
 
         def _worker():
-            log_path = Path(__file__).parent / "gui_debug.log"
             try:
-                with open(log_path, "a", encoding="utf-8") as f:
-                    f.write(f"\n--- {datetime.datetime.now()} ---\n")
-                    f.write(f"User message: {text}\n")
-                    f.write(f"History length: {len(self.history)}\n")
-                    f.write("Calling run_agent_loop...\n")
+                # Refresh profile info each turn
+                self.agent.set_system_prompt(core.build_system_prompt(core.load_profile()))
                 
-                final_text, new_history = core.run_agent_loop(
-                    self.history, system_prompt
+                final_text = self.agent.chat(
+                    user_input=text, 
+                    on_tool_call=lambda name, args, result: self.after(0, lambda: self._log_tool(name, args, result))
                 )
                 
-                with open(log_path, "a", encoding="utf-8") as f:
-                    f.write(f"SUCCESS: {final_text[:200] if final_text else '(empty)'}\n")
-                
-                self.history = new_history
+                # Update local state from agent state
+                self.history = self.agent.history
                 core.save_memory(self.history)
+                
                 self.after(0, lambda: self._on_response(final_text))
             except Exception as e:
-                import traceback
-                with open(log_path, "a", encoding="utf-8") as f:
-                    f.write(f"CRASH: {e}\n")
-                    traceback.print_exc(file=f)
+                logger.exception("Unexpected error in GUI worker thread")
                 self.after(0, lambda: self._on_error(str(e)))
 
         threading.Thread(target=_worker, daemon=True).start()
 
     def _on_response(self, text: str):
-        print(f"[GUI DEBUG] _on_response called with: {text[:100] if text else '(empty)'}")
         tool_summary = "\n".join(self._pending_tool_lines) if self._pending_tool_lines else ""
         self._add_bubble(text, "sealo", tool_info=tool_summary)
         self._set_thinking(False)
@@ -488,7 +579,6 @@ class SealoGUI(ctk.CTk):
             core.speak(text)
 
     def _on_error(self, error: str):
-        print(f"[GUI DEBUG] _on_error called with: {error}")
         self._add_bubble(f"Error: {error}", "sealo")
         self._set_thinking(False)
 
